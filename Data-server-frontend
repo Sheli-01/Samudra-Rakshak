@@ -1,0 +1,340 @@
+
+SAMUDRA RAKSHAK - UNIFIED BACKEND SERVER
+Handles data from Vessel (ESP32), Buoy (Raspberry Pi), and Base Station
+Serves data to frontend dashboards via REST API and WebSocket
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
+from datetime import datetime
+import json
+import os
+from collections import deque
+import threading
+import time
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'samudra_rakshak_2024_secret_key'
+
+# Enable CORS for CodeSandbox frontends
+CORS(app, resources={
+    r"/*": {
+        "origins": ["https://khfsr5.csb.app", "https://k8ptgh.csb.app", "*"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
+
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# In-memory data storage (for free tier without database)
+# Using deque for automatic size limiting
+vessel_data_history = deque(maxlen=1000)  # Last 1000 readings
+buoy_data_history = deque(maxlen=1000)
+base_station_data_history = deque(maxlen=1000)
+
+# Current/latest data for quick access
+current_vessel_data = {}
+current_buoy_data = {}
+current_base_station_data = {}
+
+# System status
+system_status = {
+    "vessel_online": False,
+    "buoy_online": False,
+    "base_station_online": False,
+    "vessel_last_seen": None,
+    "buoy_last_seen": None,
+    "base_station_last_seen": None,
+    "total_messages": 0
+}
+
+# Lock for thread safety
+data_lock = threading.Lock()
+
+# ==================== VESSEL ENDPOINTS ====================
+
+@app.route('/api/vessel/data', methods=['POST', 'OPTIONS'])
+def receive_vessel_data():
+    """Receive data from Vessel ESP32"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        data = request.get_json()
+        
+        # Add server timestamp
+        data['server_timestamp'] = datetime.now().isoformat()
+        
+        with data_lock:
+            # Store in history
+            vessel_data_history.append(data)
+            
+            # Update current data
+            global current_vessel_data
+            current_vessel_data = data
+            
+            # Update system status
+            system_status['vessel_online'] = True
+            system_status['vessel_last_seen'] = datetime.now().isoformat()
+            system_status['total_messages'] += 1
+        
+        # Emit to connected dashboards via WebSocket
+        socketio.emit('vessel_update', data, namespace='/')
+        
+        print(f"✅ Vessel data received: {data.get('id')} | GPS: {data.get('lat'):.4f}, {data.get('lon'):.4f}")
+        
+        return jsonify({
+            "status": "success",
+            "message": "Data received",
+            "timestamp": data['server_timestamp']
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error receiving vessel data: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+@app.route('/api/vessel/latest', methods=['GET'])
+def get_latest_vessel():
+    """Get latest vessel data"""
+    with data_lock:
+        return jsonify(current_vessel_data), 200
+
+@app.route('/api/vessel/history', methods=['GET'])
+def get_vessel_history():
+    """Get vessel data history"""
+    limit = request.args.get('limit', 100, type=int)
+    with data_lock:
+        data = list(vessel_data_history)[-limit:]
+    return jsonify(data), 200
+
+# ==================== BUOY ENDPOINTS ====================
+
+@app.route('/api/buoy/data', methods=['POST', 'OPTIONS'])
+def receive_buoy_data():
+    """Receive data from Buoy Raspberry Pi"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        data = request.get_json()
+        data['server_timestamp'] = datetime.now().isoformat()
+        
+        with data_lock:
+            buoy_data_history.append(data)
+            global current_buoy_data
+            current_buoy_data = data
+            
+            system_status['buoy_online'] = True
+            system_status['buoy_last_seen'] = datetime.now().isoformat()
+            system_status['total_messages'] += 1
+        
+        socketio.emit('buoy_update', data, namespace='/')
+        
+        print(f"✅ Buoy data received: {data.get('buoy_id')} | GPS: {data.get('lat'):.4f}, {data.get('lon'):.4f}")
+        
+        return jsonify({
+            "status": "success",
+            "message": "Data received",
+            "timestamp": data['server_timestamp']
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error receiving buoy data: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+@app.route('/api/buoy/latest', methods=['GET'])
+def get_latest_buoy():
+    """Get latest buoy data"""
+    with data_lock:
+        return jsonify(current_buoy_data), 200
+
+@app.route('/api/buoy/history', methods=['GET'])
+def get_buoy_history():
+    """Get buoy data history"""
+    limit = request.args.get('limit', 100, type=int)
+    with data_lock:
+        data = list(buoy_data_history)[-limit:]
+    return jsonify(data), 200
+
+# ==================== BASE STATION ENDPOINTS ====================
+
+@app.route('/api/basestation/data', methods=['POST', 'OPTIONS'])
+def receive_basestation_data():
+    """Receive data from Base Station"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        data = request.get_json()
+        data['server_timestamp'] = datetime.now().isoformat()
+        
+        with data_lock:
+            base_station_data_history.append(data)
+            global current_base_station_data
+            current_base_station_data = data
+            
+            system_status['base_station_online'] = True
+            system_status['base_station_last_seen'] = datetime.now().isoformat()
+            system_status['total_messages'] += 1
+        
+        socketio.emit('basestation_update', data, namespace='/')
+        
+        print(f"✅ Base Station data received: Messages relayed: {data.get('messages_relayed', 0)}")
+        
+        return jsonify({
+            "status": "success",
+            "message": "Data received",
+            "timestamp": data['server_timestamp']
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error receiving base station data: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+@app.route('/api/basestation/latest', methods=['GET'])
+def get_latest_basestation():
+    """Get latest base station data"""
+    with data_lock:
+        return jsonify(current_base_station_data), 200
+
+@app.route('/api/basestation/history', methods=['GET'])
+def get_basestation_history():
+    """Get base station data history"""
+    limit = request.args.get('limit', 100, type=int)
+    with data_lock:
+        data = list(base_station_data_history)[-limit:]
+    return jsonify(data), 200
+
+# ==================== COMBINED/DASHBOARD ENDPOINTS ====================
+
+@app.route('/api/all/latest', methods=['GET'])
+def get_all_latest():
+    """Get latest data from all sources"""
+    with data_lock:
+        return jsonify({
+            "vessel": current_vessel_data,
+            "buoy": current_buoy_data,
+            "base_station": current_base_station_data,
+            "system_status": system_status
+        }), 200
+
+@app.route('/api/status', methods=['GET'])
+def get_system_status():
+    """Get system status"""
+    with data_lock:
+        return jsonify(system_status), 200
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "uptime": time.time()
+    }), 200
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint with API documentation"""
+    return jsonify({
+        "service": "Samudra Rakshak Backend",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "vessel": {
+                "POST /api/vessel/data": "Submit vessel data",
+                "GET /api/vessel/latest": "Get latest vessel data",
+                "GET /api/vessel/history?limit=100": "Get vessel history"
+            },
+            "buoy": {
+                "POST /api/buoy/data": "Submit buoy data",
+                "GET /api/buoy/latest": "Get latest buoy data",
+                "GET /api/buoy/history?limit=100": "Get buoy history"
+            },
+            "base_station": {
+                "POST /api/basestation/data": "Submit base station data",
+                "GET /api/basestation/latest": "Get latest base station data",
+                "GET /api/basestation/history?limit=100": "Get base station history"
+            },
+            "system": {
+                "GET /api/all/latest": "Get all latest data",
+                "GET /api/status": "Get system status",
+                "GET /api/health": "Health check"
+            }
+        }
+    }), 200
+
+# ==================== WEBSOCKET HANDLERS ====================
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle client connection"""
+    print(f"🔌 Client connected: {request.sid}")
+    emit('connection_response', {'status': 'connected'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection"""
+    print(f"🔌 Client disconnected: {request.sid}")
+
+@socketio.on('request_all_data')
+def handle_request_all_data():
+    """Send all current data to requesting client"""
+    with data_lock:
+        emit('all_data', {
+            "vessel": current_vessel_data,
+            "buoy": current_buoy_data,
+            "base_station": current_base_station_data,
+            "system_status": system_status
+        })
+
+# ==================== BACKGROUND TASKS ====================
+
+def check_device_status():
+    """Background task to check if devices are online"""
+    while True:
+        time.sleep(30)  # Check every 30 seconds
+        
+        current_time = datetime.now()
+        
+        with data_lock:
+            # Check vessel (offline if no data for 30 seconds)
+            if system_status['vessel_last_seen']:
+                last_seen = datetime.fromisoformat(system_status['vessel_last_seen'])
+                if (current_time - last_seen).total_seconds() > 30:
+                    system_status['vessel_online'] = False
+            
+            # Check buoy
+            if system_status['buoy_last_seen']:
+                last_seen = datetime.fromisoformat(system_status['buoy_last_seen'])
+                if (current_time - last_seen).total_seconds() > 30:
+                    system_status['buoy_online'] = False
+            
+            # Check base station
+            if system_status['base_station_last_seen']:
+                last_seen = datetime.fromisoformat(system_status['base_station_last_seen'])
+                if (current_time - last_seen).total_seconds() > 30:
+                    system_status['base_station_online'] = False
+
+# Start background task
+status_thread = threading.Thread(target=check_device_status, daemon=True)
+status_thread.start()
+
+# ==================== MAIN ====================
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8000))
+    print(f"\n{'='*60}")
+    print(f"🌊 SAMUDRA RAKSHAK BACKEND SERVER")
+    print(f"{'='*60}")
+    print(f"🚀 Starting server on port {port}...")
+    print(f"📡 WebSocket enabled for real-time updates")
+    print(f"🔓 CORS enabled for CodeSandbox frontends")
+    print(f"{'='*60}\n")
+    
+    # Use socketio.run instead of app.run for WebSocket support
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
+
+add python code
