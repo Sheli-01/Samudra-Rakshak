@@ -1,0 +1,306 @@
+/*
+ * SAMUDRA RAKSHAK - VESSEL UNIT (ESP32)
+ * Connects to WiFi and sends data to cloud backend
+ * Also transmits via LoRa to buoy
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <LoRa.h>
+#include <TinyGPS++.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ==================== CONFIGURATION ====================
+// WiFi Credentials
+const char* ssid = "YOUR_WIFI_SSID";          // CHANGE THIS
+const char* password = "YOUR_WIFI_PASSWORD";   // CHANGE THIS
+
+// Cloud Backend URL
+const char* serverUrl = "http://YOUR_SERVER_IP:8000/api/vessel/data";  // CHANGE THIS
+
+// Vessel ID
+const char* VESSEL_ID = "VESSEL_001";
+
+// Update intervals (milliseconds)
+const unsigned long CLOUD_UPDATE_INTERVAL = 5000;   // 5 seconds
+const unsigned long LORA_UPDATE_INTERVAL = 10000;   // 10 seconds
+
+// ==================== PIN DEFINITIONS ====================
+// LoRa SX1278 (SPI)
+#define LORA_SCK  18
+#define LORA_MISO 19
+#define LORA_MOSI 23
+#define LORA_CS   5
+#define LORA_RST  14
+#define LORA_DIO0 2
+
+// GPS NEO-6M (Serial2)
+#define GPS_RX 16
+#define GPS_TX 17
+
+// DS18B20 Temperature
+#define TEMP_PIN 4
+
+// Emergency Button
+#define EMERGENCY_BTN 15
+
+// Status LED
+#define STATUS_LED 2
+
+// Analog Sensors (ESP32 ADC)
+#define PH_PIN 34        // ADC1_CH6
+#define TURBIDITY_PIN 35  // ADC1_CH7
+
+// ==================== GLOBAL OBJECTS ====================
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature tempSensor(&oneWire);
+
+WiFiClient wifiClient;
+HTTPClient http;
+
+// ==================== STATE VARIABLES ====================
+unsigned long lastCloudUpdate = 0;
+unsigned long lastLoRaUpdate = 0;
+bool emergencyState = false;
+int messageCount = 0;
+
+struct SensorData {
+  float latitude = 0;
+  float longitude = 0;
+  int satellites = 0;
+  float temperature = 0;
+  float pH = 0;
+  float turbidity = 0;
+  bool emergency = false;
+  bool gpsValid = false;
+} sensorData;
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  
+  Serial.println("\n╔═══════════════════════════════════════════╗");
+  Serial.println("║  SAMUDRA RAKSHAK - VESSEL UNIT (ESP32)   ║");
+  Serial.println("╚═══════════════════════════════════════════╝\n");
+  
+  // Initialize pins
+  pinMode(STATUS_LED, OUTPUT);
+  pinMode(EMERGENCY_BTN, INPUT_PULLUP);
+  
+  // Blink LED during setup
+  blinkLED(3, 200);
+  
+  // Initialize GPS
+  Serial.println("Initializing GPS...");
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  delay(500);
+  Serial.println("✓ GPS initialized");
+  
+  // Initialize temperature sensor
+  Serial.println("Initializing DS18B20...");
+  tempSensor.begin();
+  Serial.println("✓ DS18B20 initialized");
+  
+  // Initialize LoRa
+  Serial.println("Initializing LoRa...");
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  
+  if (!LoRa.begin(433E6)) {
+    Serial.println("✗ LoRa initialization failed!");
+  } else {
+    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(125E3);
+    LoRa.setCodingRate4(5);
+    LoRa.setSyncWord(0x12);
+    Serial.println("✓ LoRa initialized (433 MHz)");
+  }
+  
+  // Initialize WiFi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi connected");
+    Serial.print("✓ IP Address: ");
+    Serial.println(WiFi.localIP());
+    blinkLED(5, 100);
+  } else {
+    Serial.println("\n✗ WiFi connection failed!");
+    Serial.println("  Will continue with LoRa only");
+  }
+  
+  Serial.println("\n✓ System ready!");
+  Serial.println("  Reading sensors...\n");
+  
+  digitalWrite(STATUS_LED, HIGH);
+}
+
+// ==================== MAIN LOOP ====================
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // Read GPS data continuously
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+  
+  // Check emergency button
+  if (digitalRead(EMERGENCY_BTN) == LOW) {
+    emergencyState = true;
+    digitalWrite(STATUS_LED, !digitalRead(STATUS_LED)); // Flash LED
+  }
+  
+  // Read sensors
+  readSensors();
+  
+  // Send to cloud via WiFi
+  if (WiFi.status() == WL_CONNECTED && 
+      (currentMillis - lastCloudUpdate >= CLOUD_UPDATE_INTERVAL)) {
+    sendToCloud();
+    lastCloudUpdate = currentMillis;
+  }
+  
+  // Send to buoy via LoRa
+  if (currentMillis - lastLoRaUpdate >= LORA_UPDATE_INTERVAL) {
+    sendViaLoRa();
+    lastLoRaUpdate = currentMillis;
+  }
+  
+  delay(100);
+}
+
+// ==================== SENSOR READING ====================
+void readSensors() {
+  // GPS Data
+  if (gps.location.isValid()) {
+    sensorData.latitude = gps.location.lat();
+    sensorData.longitude = gps.location.lng();
+    sensorData.satellites = gps.satellites.value();
+    sensorData.gpsValid = true;
+  } else {
+    sensorData.gpsValid = false;
+  }
+  
+  // Temperature
+  tempSensor.requestTemperatures();
+  sensorData.temperature = tempSensor.getTempCByIndex(0);
+  
+  // pH Sensor (analog read, convert to pH scale)
+  int phRaw = analogRead(PH_PIN);
+  sensorData.pH = map(phRaw, 0, 4095, 0, 1400) / 100.0;  // Simple mapping
+  
+  // Turbidity (analog read, convert to NTU)
+  int turbRaw = analogRead(TURBIDITY_PIN);
+  sensorData.turbidity = map(turbRaw, 0, 4095, 0, 3000) / 10.0;
+  
+  // Emergency state
+  sensorData.emergency = emergencyState;
+}
+
+// ==================== CLOUD COMMUNICATION ====================
+void sendToCloud() {
+  StaticJsonDocument<512> doc;
+  
+  doc["id"] = VESSEL_ID;
+  doc["timestamp"] = millis();
+  doc["lat"] = sensorData.latitude;
+  doc["lon"] = sensorData.longitude;
+  doc["sats"] = sensorData.satellites;
+  doc["gps_valid"] = sensorData.gpsValid;
+  doc["temp"] = sensorData.temperature;
+  doc["pH"] = sensorData.pH;
+  doc["turb"] = sensorData.turbidity;
+  doc["emergency"] = sensorData.emergency;
+  doc["message_id"] = messageCount++;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  http.begin(wifiClient, serverUrl);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpResponseCode = http.POST(jsonString);
+  
+  if (httpResponseCode > 0) {
+    Serial.print("✓ Cloud update sent (");
+    Serial.print(httpResponseCode);
+    Serial.println(")");
+    blinkLED(1, 50);
+  } else {
+    Serial.print("✗ Cloud error: ");
+    Serial.println(httpResponseCode);
+  }
+  
+  http.end();
+}
+
+// ==================== LORA COMMUNICATION ====================
+void sendViaLoRa() {
+  StaticJsonDocument<512> doc;
+  
+  doc["vessel_id"] = VESSEL_ID;
+  doc["lat"] = sensorData.latitude;
+  doc["lon"] = sensorData.longitude;
+  doc["sats"] = sensorData.satellites;
+  doc["temp"] = sensorData.temperature;
+  doc["pH"] = sensorData.pH;
+  doc["turb"] = sensorData.turbidity;
+  doc["emergency"] = sensorData.emergency;
+  doc["timestamp"] = millis();
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  LoRa.beginPacket();
+  LoRa.print(jsonString);
+  LoRa.endPacket();
+  
+  Serial.print("📡 LoRa TX: ");
+  Serial.println(jsonString.substring(0, 50) + "...");
+  
+  blinkLED(2, 100);
+}
+
+// ==================== UTILITY FUNCTIONS ====================
+void blinkLED(int times, int delayMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(STATUS_LED, HIGH);
+    delay(delayMs);
+    digitalWrite(STATUS_LED, LOW);
+    delay(delayMs);
+  }
+}
+
+void printSensorData() {
+  Serial.println("\n--- Sensor Data ---");
+  Serial.print("GPS: ");
+  Serial.print(sensorData.latitude, 6);
+  Serial.print(", ");
+  Serial.print(sensorData.longitude, 6);
+  Serial.print(" (");
+  Serial.print(sensorData.satellites);
+  Serial.println(" sats)");
+  Serial.print("Temp: ");
+  Serial.print(sensorData.temperature);
+  Serial.println("°C");
+  Serial.print("pH: ");
+  Serial.println(sensorData.pH);
+  Serial.print("Turbidity: ");
+  Serial.print(sensorData.turbidity);
+  Serial.println(" NTU");
+  Serial.print("Emergency: ");
+  Serial.println(sensorData.emergency ? "YES" : "NO");
+  Serial.println("-------------------\n");
+}
